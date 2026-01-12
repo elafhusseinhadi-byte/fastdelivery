@@ -1,273 +1,115 @@
-import time
+from fastapi import FastAPI
+from pydantic import BaseModel
 import requests
-import numpy as np
-import pandas as pd
-import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import math
 
-# =========================================================
-# CONFIG
-# =========================================================
-SERVER = "https://drns-1.onrender.com"
-REFRESH_SEC = 2
+app = FastAPI(title="Fast Delivery – Hilla (Geocoding Server)")
 
-st.set_page_config(page_title="UAV Dashboard", layout="wide")
+# ============================================================
+# CONSTANTS – HILLA / BABYLON
+# ============================================================
 
-# =========================================================
-# STYLE (SAFE, NO CUT)
-# =========================================================
-st.markdown("""
-<style>
-.block-container {
-    padding-top: 1.2rem;
-    padding-bottom: 0.5rem;
-}
-h2 {
-    margin-top: 0;
-    margin-bottom: 0.6rem;
-}
-.stAlert { display: none; }
-</style>
-""", unsafe_allow_html=True)
+LAT_MIN = 32.1
+LON_MIN = 44.1
 
-# =========================================================
-# TITLE
-# =========================================================
-st.markdown(
-    "<h2>UAV Real-Time Monitoring & Collision Avoidance Dashboard</h2>",
-    unsafe_allow_html=True
-)
+LAT_MAX = 32.8
+LON_MAX = 44.8
 
-# =========================================================
-# FETCH DATA
-# =========================================================
-@st.cache_data(ttl=2)
-def fetch_data():
-    before = requests.get(SERVER + "/uavs?process=false", timeout=20).json()
-    after  = requests.get(SERVER + "/uavs?process=true",  timeout=20).json()
-    return before, after
+GRID_KM = 5
+KM_PER_DEG_LAT = 111
+KM_PER_DEG_LON = 94
 
-try:
-    data_before, data_after = fetch_data()
-except Exception as e:
-    st.error(f"Server connection failed: {e}")
-    st.stop()
+# ============================================================
+# DATA MODELS
+# ============================================================
 
-# =========================================================
-# TO DATAFRAME
-# =========================================================
-def to_df(data):
-    rows = []
-    for u in data["uavs"]:
-        rows.append({
-            "UAV_ID": u["uav_id"],
-            "X": u["x"],              # longitude
-            "Y": u["y"],              # latitude
-            "Status": u["status"],
-            "dmin": u["min_distance_km"],
-            "PredX": u["predicted"]["x"] if u.get("predicted") else np.nan,
-            "PredY": u["predicted"]["y"] if u.get("predicted") else np.nan
-        })
-    return pd.DataFrame(rows)
+class Order(BaseModel):
+    order_id: int
+    place: str   # اسم الشارع أو المنطقة
 
-dfB = to_df(data_before)
-dfA = to_df(data_after)
+# ============================================================
+# GEOCODING – OpenStreetMap (Nominatim)
+# ============================================================
 
-# =========================================================
-# COLLISION ALERT
-# =========================================================
-collision_df = dfA[dfA["Status"] == "collision"]
-collision_count = len(collision_df)
+def geocode_osm(place_name: str):
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": place_name + " الحلة العراق",
+        "format": "json",
+        "limit": 1
+    }
 
-if collision_count > 0:
-    st.error(f"🚨 COLLISION ALERT: {collision_count} UAV(s) detected!")
-else:
-    st.success("✅ No collisions detected")
+    headers = {
+        "User-Agent": "FastDelivery-Hilla/1.0"
+    }
 
-# =========================================================
-# ===== TOP ROW : 4 MAIN PLOTS =====
-# =========================================================
-colors = {
-    "safe": "blue",
-    "outer_near": "gold",
-    "inner_near": "orange",
-    "collision": "red"
-}
+    r = requests.get(url, params=params, headers=headers, timeout=10)
 
-fig_top = make_subplots(
-    rows=1, cols=4,
-    subplot_titles=[
-        "BEFORE – Raw Positions",
-        "Prediction",
-        "AFTER – Avoidance",
-        "Status Distribution"
-    ]
-)
+    if r.status_code != 200:
+        return None, None
 
-# BEFORE
-for s in colors:
-    d = dfB[dfB["Status"] == s]
-    fig_top.add_trace(
-        go.Scatter(
-            x=d["X"], y=d["Y"],
-            mode="markers",
-            marker=dict(size=8, symbol="circle-open", color=colors[s]),
-            name=f"BEFORE {s}"
-        ),
-        row=1, col=1
-    )
+    data = r.json()
+    if not data:
+        return None, None
 
-# PREDICTION
-valid = dfB["PredX"].notna()
-fig_top.add_trace(go.Scatter(
-    x=dfB[valid]["X"], y=dfB[valid]["Y"],
-    mode="markers",
-    marker=dict(size=7, symbol="circle-open", color="black"),
-    name="Before"
-), row=1, col=2)
+    lat = float(data[0]["lat"])
+    lon = float(data[0]["lon"])
+    return lat, lon
 
-fig_top.add_trace(go.Scatter(
-    x=dfB[valid]["PredX"], y=dfB[valid]["PredY"],
-    mode="markers",
-    marker=dict(size=8, symbol="circle-open", color="magenta"),
-    name="Predicted"
-), row=1, col=2)
+# ============================================================
+# GRID COMPUTATION
+# ============================================================
 
-# AFTER
-for s in colors:
-    d = dfA[dfA["Status"] == s]
-    fig_top.add_trace(
-        go.Scatter(
-            x=d["X"], y=d["Y"],
-            mode="markers",
-            marker=dict(size=8, symbol="circle-open", color=colors[s]),
-            name=f"AFTER {s}"
-        ),
-        row=1, col=3
-    )
+def latlon_to_grid(lat, lon):
+    x = (lon - LON_MIN) * KM_PER_DEG_LON
+    y = (lat - LAT_MIN) * KM_PER_DEG_LAT
 
-# STATUS DISTRIBUTION
-labels = list(colors.keys())
-fig_top.add_trace(go.Bar(
-    x=labels,
-    y=[sum(dfB["Status"] == s) for s in labels],
-    name="Before"
-), row=1, col=4)
+    gx = int(x // GRID_KM)
+    gy = int(y // GRID_KM)
 
-fig_top.add_trace(go.Bar(
-    x=labels,
-    y=[sum(dfA["Status"] == s) for s in labels],
-    name="After"
-), row=1, col=4)
+    return gx, gy
 
-fig_top.update_layout(
-    height=360,
-    barmode="group",
-    margin=dict(l=10, r=10, t=40, b=10),
-    legend=dict(orientation="h", y=-0.28)
-)
+# ============================================================
+# API ENDPOINTS
+# ============================================================
 
-st.plotly_chart(fig_top, use_container_width=True)
+@app.get("/")
+def root():
+    return {"service": "Fast Delivery – Hilla", "status": "running"}
 
-# =========================================================
-# ===== SECOND ROW : 3 ANALYSIS PLOTS =====
-# =========================================================
-dmin_before = dfB["dmin"].values
-dmin_after  = dfA["dmin"].values
-delta_dmin  = dmin_after - dmin_before
+@app.post("/order")
+def create_order(order: Order):
 
-pred_move = np.sqrt(
-    (dfB["PredX"] - dfB["X"])**2 +
-    (dfB["PredY"] - dfB["Y"])**2
-)
+    # 1) Geocoding
+    lat, lon = geocode_osm(order.place)
 
-# Predicted displacement (Line + Markers)
-fig1 = go.Figure()
-fig1.add_trace(go.Scatter(
-    y=pred_move,
-    mode="lines+markers",
-    line=dict(width=2, color="blue"),
-    marker=dict(size=7, symbol="circle-open")
-))
-fig1.update_layout(
-    title="Predicted Displacement",
-    xaxis_title="UAV Index",
-    yaxis_title="Predicted Displacement (km)",
-    height=260
-)
+    if lat is None:
+        return {
+            "order_id": order.order_id,
+            "status": "failed",
+            "reason": "Location not found"
+        }
 
-# Delta dmin
-fig2 = go.Figure()
-fig2.add_trace(go.Bar(y=delta_dmin))
-fig2.update_layout(
-    title="Δ dmin",
-    xaxis_title="UAV Index",
-    yaxis_title="Δ Minimum Distance (km)",
-    height=260
-)
+    # 2) Check if inside Hilla
+    if not (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX):
+        return {
+            "order_id": order.order_id,
+            "status": "rejected",
+            "reason": "Outside Hilla service area",
+            "location": {"lat": lat, "lon": lon}
+        }
 
-# dmin before vs after
-fig3 = go.Figure()
-fig3.add_trace(go.Scatter(y=dmin_before, mode="lines+markers", name="Before"))
-fig3.add_trace(go.Scatter(y=dmin_after,  mode="lines+markers", name="After"))
-fig3.update_layout(
-    title="dmin Before vs After",
-    xaxis_title="UAV Index",
-    yaxis_title="Minimum Distance (km)",
-    height=260
-)
+    # 3) Grid
+    gx, gy = latlon_to_grid(lat, lon)
 
-c1, c2, c3 = st.columns(3)
-with c1: st.plotly_chart(fig1, use_container_width=True)
-with c2: st.plotly_chart(fig2, use_container_width=True)
-with c3: st.plotly_chart(fig3, use_container_width=True)
+    # 4) Assign UAV (1 UAV per Grid)
+    assigned_uav = f"UAV_{gx}_{gy}"
 
-# =========================================================
-# UAV MAP
-# =========================================================
-st.subheader("🗺️ UAV Geographical Map")
-
-map_fig = go.Figure()
-
-for s, col in colors.items():
-    d = dfA[dfA["Status"] == s]
-    map_fig.add_trace(go.Scattermapbox(
-        lat=d["Y"],
-        lon=d["X"],
-        mode="markers",
-        marker=dict(size=11, color=col),
-        name=s
-    ))
-
-map_fig.update_layout(
-    mapbox=dict(
-        style="open-street-map",
-        center=dict(lat=dfA["Y"].mean(), lon=dfA["X"].mean()),
-        zoom=11
-    ),
-    height=420,
-    margin=dict(l=0, r=0, t=30, b=0)
-)
-
-st.plotly_chart(map_fig, use_container_width=True)
-
-# =========================================================
-# TABLES
-# =========================================================
-st.subheader("RAW UAV DATA")
-
-t1, t2 = st.columns(2)
-with t1:
-    st.markdown("**BEFORE**")
-    st.dataframe(dfB, use_container_width=True, height=320)
-
-with t2:
-    st.markdown("**AFTER**")
-    st.dataframe(dfA, use_container_width=True, height=320)
-
-# =========================================================
-# AUTO REFRESH
-# =========================================================
-time.sleep(REFRESH_SEC)
-st.rerun()
+    return {
+        "order_id": order.order_id,
+        "input_place": order.place,
+        "location": {"lat": lat, "lon": lon},
+        "grid": [gx, gy],
+        "assigned_uav": assigned_uav,
+        "status": "accepted"
+    }
