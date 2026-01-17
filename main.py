@@ -1,8 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import requests
-import math
-import csv
+import requests, math, csv, threading, time
 from datetime import datetime
 
 # ============================================================
@@ -10,26 +8,23 @@ from datetime import datetime
 # ============================================================
 
 app = FastAPI(
-    title="Fast Delivery – Hilla (Babylon)",
-    description="Fast Delivery Server using OpenStreetMap + UAV Integration",
-    version="2.0"
+    title="Fast Delivery – Hilla (All-in-One Server)",
+    version="3.0"
 )
 
 # ============================================================
-# CONSTANTS – HILLA (BABYLON)
+# CONSTANTS
 # ============================================================
 
-LAT_MIN = 32.1
-LAT_MAX = 32.8
-LON_MIN = 44.1
-LON_MAX = 44.8
+LAT_MIN, LAT_MAX = 32.1, 32.8
+LON_MIN, LON_MAX = 44.1, 44.8
 
 GRID_KM = 5.0
-KM_PER_DEG_LAT = 111.0
-KM_PER_DEG_LON = 94.0
+KM_LAT = 111.0
+KM_LON = 94.0
 
 UAV_SPEED_KMH = 40
-UAV_SERVER = "https://drns-1.onrender.com"
+STEP_TIME = 1.0   # seconds
 
 # ============================================================
 # DATA MODELS
@@ -40,148 +35,132 @@ class Order(BaseModel):
     place: str
 
 # ============================================================
-# OPENSTREETMAP GEOCODING
+# UAV STORAGE (GLOBAL STATE)
 # ============================================================
 
-def geocode_osm(place_name: str):
+UAVS = {}
+
+def init_uavs():
+    for gx in range(0, 10):
+        for gy in range(0, 10):
+            uav_id = f"UAV_{gx}_{gy}"
+            lat = LAT_MIN + (gy + 0.5) * GRID_KM / KM_LAT
+            lon = LON_MIN + (gx + 0.5) * GRID_KM / KM_LON
+            UAVS[uav_id] = {
+                "uav_id": uav_id,
+                "lat": lat,
+                "lon": lon,
+                "status": "idle",
+                "target": None
+            }
+
+init_uavs()
+
+# ============================================================
+# GEOCODING
+# ============================================================
+
+def geocode(place):
     url = "https://nominatim.openstreetmap.org/search"
-    headers = {"User-Agent": "FastDelivery-Hilla/2.0"}
-
-    queries = [
-        f"{place_name} الحلة العراق",
-        f"{place_name} الحلة",
-        f"{place_name} بابل العراق",
-        f"{place_name} Hilla Iraq",
-        f"{place_name} Babylon Iraq"
-    ]
-
-    for q in queries:
-        try:
-            params = {"q": q, "format": "json", "limit": 1}
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            if r.status_code == 200 and r.json():
-                lat = float(r.json()[0]["lat"])
-                lon = float(r.json()[0]["lon"])
-                return lat, lon
-        except:
-            continue
-
+    headers = {"User-Agent": "FastDelivery-Hilla/3.0"}
+    q = f"{place} الحلة العراق"
+    try:
+        r = requests.get(url, params={"q": q, "format": "json", "limit": 1},
+                         headers=headers, timeout=10)
+        if r.json():
+            return float(r.json()[0]["lat"]), float(r.json()[0]["lon"])
+    except:
+        pass
     return None, None
 
 # ============================================================
-# GRID COMPUTATION
+# GRID
 # ============================================================
 
 def latlon_to_grid(lat, lon):
-    x_km = (lon - LON_MIN) * KM_PER_DEG_LON
-    y_km = (lat - LAT_MIN) * KM_PER_DEG_LAT
-    return int(x_km // GRID_KM), int(y_km // GRID_KM)
+    gx = int(((lon - LON_MIN) * KM_LON) // GRID_KM)
+    gy = int(((lat - LAT_MIN) * KM_LAT) // GRID_KM)
+    return gx, gy
 
 # ============================================================
-# DISTANCE + ETA
+# DISTANCE
 # ============================================================
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
+    dlat = math.radians(lat2-lat1)
+    dlon = math.radians(lon2-lon1)
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) \
         * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return 2 * R * math.asin(math.sqrt(a))
 
-def estimate_eta(distance_km):
-    return (distance_km / UAV_SPEED_KMH) * 60
-
 # ============================================================
-# UAV SERVER COMMUNICATION
+# UAV MOVEMENT LOOP
 # ============================================================
 
-def send_to_uav(uav_id, lat, lon):
-    payload = {
-        "uav_id": uav_id,
-        "target": {"lat": lat, "lon": lon}
-    }
-    try:
-        requests.post(f"{UAV_SERVER}/assign", json=payload, timeout=5)
-    except:
-        pass
+def uav_loop():
+    while True:
+        for u in UAVS.values():
+            if u["target"]:
+                t = u["target"]
+                d = haversine(u["lat"], u["lon"], t["lat"], t["lon"])
+                if d < 0.05:
+                    u["lat"], u["lon"] = t["lat"], t["lon"]
+                    u["status"] = "idle"
+                    u["target"] = None
+                else:
+                    step = (UAV_SPEED_KMH/3600) * STEP_TIME
+                    u["lat"] += (t["lat"] - u["lat"]) * step / d
+                    u["lon"] += (t["lon"] - u["lon"]) * step / d
+        time.sleep(STEP_TIME)
+
+threading.Thread(target=uav_loop, daemon=True).start()
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-def log_order(order_id, place, gx, gy, uav, eta):
+def log_order(order_id, place, uav, eta):
     with open("orders_log.csv", "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now(),
-            order_id,
-            place,
-            gx,
-            gy,
-            uav,
-            round(eta, 2)
+        csv.writer(f).writerow([
+            datetime.now(), order_id, place, uav, round(eta, 2)
         ])
 
 # ============================================================
-# API ENDPOINTS
+# API
 # ============================================================
 
 @app.get("/")
 def root():
-    return {"service": "Fast Delivery – Hilla", "status": "running"}
+    return {"status": "Fast Delivery Server Running"}
 
-@app.get("/healthz")
-def health_check():
-    return {"status": "ok"}
+@app.get("/uavs")
+def get_uavs():
+    return {"uavs": list(UAVS.values())}
 
 @app.post("/order")
 def create_order(order: Order):
-
-    # 1) Geocode
-    lat, lon = geocode_osm(order.place)
+    lat, lon = geocode(order.place)
     if lat is None:
-        return {"order_id": order.order_id, "status": "failed", "reason": "Location not found"}
+        return {"status": "failed", "reason": "Location not found"}
 
-    # 2) Boundary check
-    if not (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX):
-        return {
-            "order_id": order.order_id,
-            "status": "rejected",
-            "reason": "Outside Hilla service area",
-            "location": {"lat": lat, "lon": lon}
-        }
-
-    # 3) Grid
     gx, gy = latlon_to_grid(lat, lon)
-    assigned_uav = f"UAV_{gx}_{gy}"
+    uav_id = f"UAV_{gx}_{gy}"
+    uav = UAVS[uav_id]
 
-    # 4) ETA (نفترض UAV بمركز الـ Grid)
-    uav_lat = LAT_MIN + (gy + 0.5) * GRID_KM / KM_PER_DEG_LAT
-    uav_lon = LON_MIN + (gx + 0.5) * GRID_KM / KM_PER_DEG_LON
-    distance_km = haversine(uav_lat, uav_lon, lat, lon)
-    eta_min = estimate_eta(distance_km)
+    dist = haversine(uav["lat"], uav["lon"], lat, lon)
+    eta = (dist / UAV_SPEED_KMH) * 60
 
-    # 5) Send mission to UAV server
-    send_to_uav(assigned_uav, lat, lon)
+    uav["target"] = {"lat": lat, "lon": lon}
+    uav["status"] = "delivering"
 
-    # 6) Log order
-    log_order(order.order_id, order.place, gx, gy, assigned_uav, eta_min)
+    log_order(order.order_id, order.place, uav_id, eta)
 
     return {
         "order_id": order.order_id,
-        "input_place": order.place,
+        "place": order.place,
+        "assigned_uav": uav_id,
+        "eta_minutes": round(eta,1),
         "location": {"lat": lat, "lon": lon},
-        "grid": [gx, gy],
-        "assigned_uav": assigned_uav,
-        "eta_minutes": round(eta_min, 1),
         "status": "accepted"
     }
-
-# ============================================================
-# RUN APP
-# ============================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
