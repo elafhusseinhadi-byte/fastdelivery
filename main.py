@@ -12,21 +12,28 @@ from datetime import datetime
 # ============================================================
 
 app = FastAPI(
-    title="Fast Delivery – Hilla (All-in-One)",
-    description="Single server for customer orders, UAV management, movement, ETA, and monitoring",
-    version="3.1"
+    title="Fast Delivery – Hilla (Central Hub)",
+    description="Real-Time UAV Fast Delivery System",
+    version="4.0"
 )
 
 # ============================================================
-# CONSTANTS (HILLA)
+# SERVICE AREA (HILLA)
 # ============================================================
 
 LAT_MIN, LAT_MAX = 32.1, 32.8
 LON_MIN, LON_MAX = 44.1, 44.8
 
-GRID_KM = 5.0
-KM_PER_DEG_LAT = 111.0
-KM_PER_DEG_LON = 94.0
+# ============================================================
+# HUB (Central Launch Point)
+# ============================================================
+
+HUB_LAT = 32.4810
+HUB_LON = 44.4320
+
+# ============================================================
+# UAV PARAMETERS
+# ============================================================
 
 UAV_SPEED_KMH = 40.0
 STEP_TIME = 1.0  # seconds
@@ -46,19 +53,14 @@ class Order(BaseModel):
 UAVS = {}
 
 def init_uavs():
-    # one UAV per grid cell
-    for gx in range(0, 10):
-        for gy in range(0, 10):
-            uav_id = f"UAV_{gx}_{gy}"
-            lat = LAT_MIN + (gy + 0.5) * GRID_KM / KM_PER_DEG_LAT
-            lon = LON_MIN + (gx + 0.5) * GRID_KM / KM_PER_DEG_LON
-            UAVS[uav_id] = {
-                "uav_id": uav_id,
-                "lat": lat,
-                "lon": lon,
-                "status": "idle",
-                "target": None
-            }
+    for i in range(15):  # عدد الطائرات
+        UAVS[f"UAV_{i}"] = {
+            "uav_id": f"UAV_{i}",
+            "lat": HUB_LAT,
+            "lon": HUB_LON,
+            "status": "idle",      # idle | delivering | returning
+            "target": None
+        }
 
 init_uavs()
 
@@ -68,7 +70,7 @@ init_uavs()
 
 def geocode_osm(place: str):
     url = "https://nominatim.openstreetmap.org/search"
-    headers = {"User-Agent": "FastDelivery-Hilla/3.1"}
+    headers = {"User-Agent": "FastDelivery-Hilla/4.0"}
 
     queries = [
         f"{place} الحلة العراق",
@@ -95,16 +97,7 @@ def geocode_osm(place: str):
     return None, None
 
 # ============================================================
-# GRID
-# ============================================================
-
-def latlon_to_grid(lat, lon):
-    gx = int(((lon - LON_MIN) * KM_PER_DEG_LON) // GRID_KM)
-    gy = int(((lat - LAT_MIN) * KM_PER_DEG_LAT) // GRID_KM)
-    return gx, gy
-
-# ============================================================
-# DISTANCE
+# DISTANCE (HAVERSINE)
 # ============================================================
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -116,25 +109,42 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 # ============================================================
-# UAV MOVEMENT LOOP
+# UAV SELECTION
+# ============================================================
+
+def get_free_uav():
+    for u in UAVS.values():
+        if u["status"] == "idle":
+            return u
+    return None
+
+# ============================================================
+# REAL-TIME UAV MOVEMENT
 # ============================================================
 
 def uav_movement_loop():
     while True:
         for u in UAVS.values():
-            if u["target"] is not None:
-                t = u["target"]
-                dist = haversine(u["lat"], u["lon"], t["lat"], t["lon"])
+            if u["target"] is None:
+                continue
 
-                if dist < 0.05:  # arrived (~50 m)
-                    u["lat"] = t["lat"]
-                    u["lon"] = t["lon"]
+            t = u["target"]
+            dist = haversine(u["lat"], u["lon"], t["lat"], t["lon"])
+
+            if dist < 0.03:  # ~30 meters
+                u["lat"] = t["lat"]
+                u["lon"] = t["lon"]
+
+                if u["status"] == "delivering":
+                    u["target"] = {"lat": HUB_LAT, "lon": HUB_LON}
+                    u["status"] = "returning"
+                else:
                     u["status"] = "idle"
                     u["target"] = None
-                else:
-                    step_km = (UAV_SPEED_KMH / 3600.0) * STEP_TIME
-                    u["lat"] += (t["lat"] - u["lat"]) * step_km / dist
-                    u["lon"] += (t["lon"] - u["lon"]) * step_km / dist
+            else:
+                step_km = (UAV_SPEED_KMH / 3600.0) * STEP_TIME
+                u["lat"] += (t["lat"] - u["lat"]) * step_km / dist
+                u["lon"] += (t["lon"] - u["lon"]) * step_km / dist
 
         time.sleep(STEP_TIME)
 
@@ -173,7 +183,6 @@ def get_uavs():
 @app.post("/order")
 def create_order(order: Order):
 
-    # 1) Geocode
     lat, lon = geocode_osm(order.place)
     if lat is None:
         return {
@@ -182,7 +191,6 @@ def create_order(order: Order):
             "reason": "Location not found"
         }
 
-    # 2) Boundary check
     if not (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX):
         return {
             "order_id": order.order_id,
@@ -191,28 +199,26 @@ def create_order(order: Order):
             "location": {"lat": lat, "lon": lon}
         }
 
-    # 3) Grid + UAV assignment
-    gx, gy = latlon_to_grid(lat, lon)
-    uav_id = f"UAV_{gx}_{gy}"
-    uav = UAVS[uav_id]
+    uav = get_free_uav()
+    if uav is None:
+        return {
+            "order_id": order.order_id,
+            "status": "rejected",
+            "reason": "No available UAVs"
+        }
 
-    # 4) ETA
     dist = haversine(uav["lat"], uav["lon"], lat, lon)
     eta_min = (dist / UAV_SPEED_KMH) * 60.0
 
-    # 5) Assign mission
     uav["target"] = {"lat": lat, "lon": lon}
     uav["status"] = "delivering"
 
-    # 6) Log
-    log_order(order.order_id, order.place, uav_id, eta_min)
+    log_order(order.order_id, order.place, uav["uav_id"], eta_min)
 
     return {
         "order_id": order.order_id,
-        "input_place": order.place,
-        "location": {"lat": lat, "lon": lon},
-        "grid": [gx, gy],
-        "assigned_uav": uav_id,
+        "place": order.place,
+        "assigned_uav": uav["uav_id"],
         "eta_minutes": round(eta_min, 1),
         "status": "accepted"
     }
